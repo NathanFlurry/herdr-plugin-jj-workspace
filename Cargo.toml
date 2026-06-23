@@ -3,9 +3,11 @@ name = "jj-workspace"
 version = "0.1.0"
 edition = "2021"
 
-# No external dependencies: install-time `cargo build --release` stays fast and
-# offline. JSON from HERDR_PLUGIN_CONTEXT_JSON is parsed with a tiny helper.
+# Same TUI stack as Herdr, so the wizard pane renders the real worktree-style
+# modal (ported from herdr's src/ui/dialogs.rs + widgets.rs).
 [dependencies]
+ratatui = "0.30"
+crossterm = "0.29"
 
 [profile.release]
 opt-level = "z"

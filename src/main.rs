@@ -1,17 +1,36 @@
-// jj-workspace: a Herdr plugin to create/remove Jujutsu (jj) workspaces.
+// jj-workspace: a Herdr plugin to create/remove Jujutsu (jj) workspaces,
+// mirroring Herdr's own git-worktree flow and dialog.
 //
 // One binary, dispatched by subcommand (set in herdr-plugin.toml):
 //   open <workspace|tab>  action: resolve the focused repo, open the wizard pane
-//   wizard                pane:   prompt a name, `jj workspace add`, then open it
+//   wizard                pane:   the worktree-style modal, `jj workspace add`, open it
 //   remove                action: `jj workspace forget` + delete dir + close in Herdr
 //
-// No external crates: install-time `cargo build --release` stays fast/offline.
+// The wizard renders the actual "new worktree" modal using the same TUI stack as
+// Herdr (ratatui + crossterm), ported from herdr's src/ui/dialogs.rs and
+// src/ui/widgets.rs so it looks and behaves like the built-in dialog.
 
 use std::env;
 use std::fs;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{self, Command};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Alignment, Constraint, Layout, Rect},
+    style::{Color, Modifier, Style},
+    symbols,
+    text::{Line, Span},
+    widgets::{Block, Borders, Clear, Paragraph},
+    Frame, Terminal,
+};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -28,7 +47,7 @@ fn main() {
 }
 
 /// Action (headless): figure out which repo is focused, then open the wizard
-/// pane, handing it the repo and the open-mode via `--env`.
+/// pane, handing it the repo and open-mode via `--env`.
 fn cmd_open(mode: &str) -> ! {
     let ctx = env::var("HERDR_PLUGIN_CONTEXT_JSON").unwrap_or_default();
     let repo = json_string_field(&ctx, "workspace_cwd")
@@ -51,7 +70,7 @@ fn cmd_open(mode: &str) -> ! {
     }
 }
 
-/// Pane (interactive, has a TTY): create the jj workspace and open it in Herdr.
+/// Pane (interactive TTY): the worktree-style modal, then create + open.
 fn cmd_wizard() -> ! {
     if which("jj").is_none() {
         fail("jj not found on PATH");
@@ -67,36 +86,47 @@ fn cmd_wizard() -> ! {
         fail(&format!("{repo} is not a jj workspace"));
     }
 
-    let name = prompt("new workspace name: ");
-    if !valid_name(&name) {
-        fail("name must be non-empty and match [A-Za-z0-9._-]");
-    }
+    let repo_name = basename(&repo);
+    let root = worktrees_root();
+    let default_branch = generated_name(seed());
 
-    let dest = format!("{}/{}.{}", workspace_root(&repo), basename(&repo), name);
-    if Path::new(&dest).exists() {
-        fail(&format!("destination already exists: {dest}"));
-    }
+    // Run the ported worktree modal; None = the user pressed esc.
+    let branch = match run_wizard(&repo_name, &root, default_branch) {
+        Ok(Some(branch)) => branch,
+        Ok(None) => process::exit(0),
+        Err(err) => fail(&format!("terminal error: {err}")),
+    };
 
-    eprintln!("+ jj workspace add --name {name} {dest}");
+    let slug = branch_to_path_slug(&branch);
+    let dest = root.join(&repo_name).join(&slug);
+    if dest.exists() {
+        fail(&format!("checkout already exists: {}", dest.display()));
+    }
+    let dest = dest.display().to_string();
+
+    eprintln!("+ jj workspace add --name {slug} {dest}");
     let mut add = Command::new("jj");
-    add.current_dir(&repo)
-        .args(["workspace", "add", "--name", &name, &dest]);
+    add.current_dir(&repo).args(["workspace", "add", "--name", &slug, &dest]);
     run_or(add, "jj workspace add", fail);
+
+    // Mirror Herdr's worktree branch with a jj bookmark of the same name (non-fatal).
+    let mut bookmark = Command::new("jj");
+    bookmark.current_dir(&dest).args(["bookmark", "create", &branch, "-r", "@"]);
+    if !run(bookmark) {
+        eprintln!("warning: could not create bookmark {branch} (workspace still created)");
+    }
 
     let herdr = herdr_bin();
     let mut open = Command::new(&herdr);
     if mode == "tab" {
         eprintln!("+ herdr tab create --cwd {dest}");
-        open.args(["tab", "create", "--cwd", &dest, "--label", &name, "--focus"]);
+        open.args(["tab", "create", "--cwd", &dest, "--label", &branch, "--focus"]);
         run_or(open, "herdr tab create", fail);
     } else {
         eprintln!("+ herdr workspace create --cwd {dest}");
-        open.args(["workspace", "create", "--cwd", &dest, "--label", &name, "--focus"]);
+        open.args(["workspace", "create", "--cwd", &dest, "--label", &branch, "--focus"]);
         run_or(open, "herdr workspace create", fail);
     }
-
-    println!("done.");
-    pause();
     process::exit(0);
 }
 
@@ -115,7 +145,6 @@ fn cmd_remove() -> ! {
         die("no workspace cwd in context");
     }
 
-    // Resolve symlinks / `..` before any destructive operation.
     let canon = match fs::canonicalize(&cwd) {
         Ok(p) => p,
         Err(err) => die(&format!("cannot resolve {cwd}: {err}")),
@@ -128,7 +157,6 @@ fn cmd_remove() -> ! {
     if canon.join(".jj").join("repo").is_dir() {
         die(&format!("refusing to remove the MAIN jj workspace ({})", canon.display()));
     }
-    // Belt-and-suspenders against deleting root / a filesystem boundary.
     if canon == Path::new("/") || canon.parent().is_none() {
         die(&format!("refusing to remove unsafe path: {}", canon.display()));
     }
@@ -147,21 +175,339 @@ fn cmd_remove() -> ! {
             close.args(["workspace", "close", &ws]);
             run_or(close, "herdr workspace close", die);
         }
-        None => eprintln!(
-            "warning: no workspace id in context; Herdr workspace left open (orphaned)"
-        ),
+        None => eprintln!("warning: no workspace id in context; Herdr workspace left open"),
     }
     println!("removed jj workspace: {}", canon.display());
     process::exit(0);
 }
 
+// --- wizard TUI (ported from herdr src/ui/dialogs.rs + widgets.rs) ----------
+
+/// Herdr's catppuccin palette (src/app/state.rs `Palette::catppuccin`).
+struct Palette {
+    accent: Color,
+    panel_bg: Color,
+    surface0: Color,
+    surface_dim: Color,
+    overlay0: Color,
+    text: Color,
+    subtext0: Color,
+    red: Color,
+}
+
+fn catppuccin() -> Palette {
+    Palette {
+        accent: Color::Rgb(137, 180, 250),
+        panel_bg: Color::Rgb(24, 24, 37),
+        surface0: Color::Rgb(49, 50, 68),
+        surface_dim: Color::Rgb(30, 30, 46),
+        overlay0: Color::Rgb(108, 112, 134),
+        text: Color::Rgb(205, 214, 244),
+        subtext0: Color::Rgb(166, 173, 200),
+        red: Color::Rgb(243, 139, 168),
+    }
+}
+
+/// Returns Some(branch) on "create and open", None on cancel (esc / ctrl-c).
+fn run_wizard(repo_name: &str, root: &Path, initial: String) -> io::Result<Option<String>> {
+    enable_raw_mode()?;
+    let mut out = io::stdout();
+    execute!(out, EnterAlternateScreen)?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
+
+    let mut name = initial;
+    let mut error: Option<String> = None;
+    let outcome = loop {
+        let _ = terminal.draw(|frame| draw_wizard(frame, &name, repo_name, root, error.as_deref()));
+        match event::read() {
+            Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => match key.code {
+                KeyCode::Esc => break None,
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break None,
+                KeyCode::Enter => {
+                    if valid_branch(&name) {
+                        break Some(name.clone());
+                    }
+                    error = Some("branch must match [A-Za-z0-9._/-]".into());
+                }
+                KeyCode::Backspace => {
+                    name.pop();
+                    error = None;
+                }
+                KeyCode::Char(c) => {
+                    name.push(c);
+                    error = None;
+                }
+                _ => {}
+            },
+            Ok(_) => {}
+            Err(err) => {
+                let _ = restore_terminal(&mut terminal);
+                return Err(err);
+            }
+        }
+    };
+
+    restore_terminal(&mut terminal)?;
+    Ok(outcome)
+}
+
+fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    Ok(())
+}
+
+/// Mirrors herdr's `render_new_linked_worktree_overlay`.
+fn draw_wizard(frame: &mut Frame, name: &str, repo_name: &str, root: &Path, error: Option<&str>) {
+    let p = catppuccin();
+    let area = frame.area();
+    dim_background(frame, area);
+    let Some(inner) = render_modal_shell(frame, area, 68, 10, &p) else {
+        return;
+    };
+    if inner.height < 7 {
+        return;
+    }
+
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas::<8>(inner);
+
+    render_modal_header(frame, rows[0], "new jj workspace", &p);
+
+    frame.render_widget(Paragraph::new(" branch").style(Style::default().fg(p.overlay0)), rows[1]);
+    let input_rect = Rect::new(rows[2].x, rows[2].y, rows[2].width, 1);
+    frame.render_widget(Clear, input_rect);
+    frame.render_widget(
+        Paragraph::new(format!(" {name}█"))
+            .style(Style::default().fg(p.text).bg(p.surface0)),
+        input_rect,
+    );
+
+    let checkout = root.join(repo_name).join(branch_to_path_slug(name)).display().to_string();
+    frame.render_widget(Paragraph::new(" checkout").style(Style::default().fg(p.overlay0)), rows[3]);
+    frame.render_widget(
+        Paragraph::new(format!(" {checkout}")).style(Style::default().fg(p.subtext0)),
+        rows[4],
+    );
+
+    if let Some(error) = error {
+        frame.render_widget(
+            Paragraph::new(format!(" {error}")).style(Style::default().fg(p.red)),
+            rows[5],
+        );
+    }
+
+    let (create_rect, cancel_rect) = button_rects(inner);
+    render_action_button(
+        frame,
+        create_rect,
+        Some("↵"),
+        "create and open",
+        Style::default()
+            .fg(panel_contrast_fg(&p))
+            .bg(p.accent)
+            .add_modifier(Modifier::BOLD),
+    );
+    render_action_button(
+        frame,
+        cancel_rect,
+        Some("esc"),
+        "cancel",
+        Style::default()
+            .fg(p.text)
+            .bg(p.surface0)
+            .add_modifier(Modifier::BOLD),
+    );
+}
+
+// Ported verbatim from herdr's src/ui/widgets.rs / src/ui.rs.
+
+fn dim_background(frame: &mut Frame, area: Rect) {
+    let buf = frame.buffer_mut();
+    for y in area.y..area.y + area.height {
+        for x in area.x..area.x + area.width {
+            let cell = &mut buf[(x, y)];
+            cell.set_style(cell.style().add_modifier(Modifier::DIM));
+        }
+    }
+}
+
+fn render_modal_shell(frame: &mut Frame, area: Rect, w: u16, h: u16, p: &Palette) -> Option<Rect> {
+    let popup = centered_popup_rect(area, w, h)?;
+    render_panel_shell(frame, popup, p.accent, p.panel_bg)
+}
+
+fn render_panel_shell(frame: &mut Frame, area: Rect, border: Color, bg: Color) -> Option<Rect> {
+    if area.width < 2 || area.height < 2 {
+        return None;
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border))
+        .border_set(symbols::border::PLAIN)
+        .style(Style::default().bg(bg));
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    Some(inner)
+}
+
+fn centered_popup_rect(area: Rect, popup_w: u16, popup_h: u16) -> Option<Rect> {
+    let popup_w = popup_w.min(area.width.saturating_sub(4));
+    let popup_h = popup_h.min(area.height.saturating_sub(2));
+    if popup_w < 4 || popup_h < 4 {
+        return None;
+    }
+    let popup_x = area.x + (area.width.saturating_sub(popup_w)) / 2;
+    let popup_y = area.y + (area.height.saturating_sub(popup_h)) / 2;
+    Some(Rect::new(popup_x, popup_y, popup_w, popup_h))
+}
+
+fn render_modal_header(frame: &mut Frame, area: Rect, title: &str, p: &Palette) {
+    let line = Line::from(vec![Span::styled(
+        title,
+        Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+    )]);
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+fn render_action_button(frame: &mut Frame, rect: Rect, hint: Option<&str>, label: &str, style: Style) {
+    frame.render_widget(
+        Paragraph::new(action_button_text(hint, label)).style(style).alignment(Alignment::Center),
+        rect,
+    );
+}
+
+fn action_button_text(hint: Option<&str>, label: &str) -> String {
+    match hint {
+        Some(hint) => format!(" {hint} {label} "),
+        None => format!(" {label} "),
+    }
+}
+
+fn panel_contrast_fg(p: &Palette) -> Color {
+    match p.panel_bg {
+        Color::Reset => p.surface_dim,
+        color => color,
+    }
+}
+
+/// Herdr's `new_linked_worktree_button_rects`: a centered "create / cancel" row.
+fn button_rects(inner: Rect) -> (Rect, Rect) {
+    let create = action_button_text(Some("↵"), "create and open").chars().count() as u16;
+    let cancel = action_button_text(Some("esc"), "cancel").chars().count() as u16;
+    let gap = 2u16;
+    let total = create + cancel + gap;
+    let mut x = inner.x + inner.width.saturating_sub(total) / 2;
+    let y = inner.y + inner.height.saturating_sub(1);
+    let create_rect = Rect::new(x, y, create, 1);
+    x = x.saturating_add(create).saturating_add(gap);
+    let cancel_rect = Rect::new(x, y, cancel, 1);
+    (create_rect, cancel_rect)
+}
+
+// --- naming (mirrors src/worktree.rs in herdr) -----------------------------
+
+const ADJECTIVES: [&str; 8] =
+    ["brave", "calm", "clear", "green", "lucky", "quiet", "rapid", "silver"];
+const NOUNS: [&str; 8] =
+    ["river", "cloud", "field", "forest", "harbor", "meadow", "stone", "valley"];
+
+fn generated_name(seed: u64) -> String {
+    let adjective = ADJECTIVES[(seed as usize) % ADJECTIVES.len()];
+    let noun = NOUNS[((seed / ADJECTIVES.len() as u64) as usize) % NOUNS.len()];
+    let suffix = seed & 0xffff;
+    format!("worktree/{adjective}-{noun}-{suffix:04x}")
+}
+
+fn branch_to_path_slug(branch: &str) -> String {
+    let mut slug = String::new();
+    let mut last_was_dash = false;
+    for ch in branch.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            last_was_dash = false;
+        } else if !last_was_dash {
+            slug.push('-');
+            last_was_dash = true;
+        }
+    }
+    let trimmed = slug.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "worktree".into()
+    } else {
+        trimmed
+    }
+}
+
+fn seed() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// Checkout root: $JJ_WORKSPACE_ROOT override > Herdr `[worktrees].directory` > ~/.herdr/worktrees.
+fn worktrees_root() -> PathBuf {
+    if let Some(root) = config_value("JJ_WORKSPACE_ROOT") {
+        return PathBuf::from(expand_tilde(root.trim_end_matches('/')));
+    }
+    if let Some(dir) = herdr_worktrees_dir() {
+        return PathBuf::from(expand_tilde(&dir));
+    }
+    PathBuf::from(expand_tilde("~/.herdr/worktrees"))
+}
+
+fn herdr_worktrees_dir() -> Option<String> {
+    let base = env::var("XDG_CONFIG_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| env::var("HOME").ok().map(|h| Path::new(&h).join(".config")))?;
+    let content = fs::read_to_string(base.join("herdr").join("config.toml")).ok()?;
+    let mut in_worktrees = false;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_worktrees = line == "[worktrees]";
+            continue;
+        }
+        if in_worktrees {
+            if let Some((key, value)) = line.split_once('=') {
+                if key.trim() == "directory" {
+                    let value = value.trim().trim_matches('"').trim_matches('\'');
+                    if !value.is_empty() {
+                        return Some(value.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn expand_tilde(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Ok(home) = env::var("HOME") {
+            return format!("{home}/{rest}");
+        }
+    }
+    path.to_string()
+}
+
 // --- helpers ---------------------------------------------------------------
 
 fn herdr_bin() -> String {
-    env::var("HERDR_BIN_PATH")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "herdr".into())
+    env::var("HERDR_BIN_PATH").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "herdr".into())
 }
 
 fn plugin_id() -> String {
@@ -175,34 +521,15 @@ fn is_jj_workspace(repo: &str) -> bool {
     !repo.is_empty() && Path::new(repo).join(".jj").exists()
 }
 
-fn valid_name(name: &str) -> bool {
-    !name.is_empty()
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+fn valid_branch(branch: &str) -> bool {
+    !branch.is_empty()
+        && branch.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
 }
 
 fn basename(path: &str) -> String {
-    Path::new(path)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("repo")
-        .to_string()
+    Path::new(path).file_name().and_then(|s| s.to_str()).unwrap_or("repo").to_string()
 }
 
-/// Where new workspaces are created: $JJ_WORKSPACE_ROOT (env or plugin `.env`),
-/// else a sibling directory of the repo.
-fn workspace_root(repo: &str) -> String {
-    if let Some(root) = config_value("JJ_WORKSPACE_ROOT") {
-        return root.trim_end_matches('/').to_string();
-    }
-    Path::new(repo)
-        .parent()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| ".".into())
-}
-
-/// Look up a config value: process env first, then `$HERDR_PLUGIN_CONFIG_DIR/.env`.
 fn config_value(key: &str) -> Option<String> {
     if let Ok(value) = env::var(key) {
         if !value.is_empty() {
@@ -230,9 +557,7 @@ fn config_value(key: &str) -> Option<String> {
 
 fn which(cmd: &str) -> Option<()> {
     let paths = env::var_os("PATH")?;
-    env::split_paths(&paths)
-        .find(|dir| dir.join(cmd).is_file())
-        .map(|_| ())
+    env::split_paths(&paths).find(|dir| dir.join(cmd).is_file()).map(|_| ())
 }
 
 fn prompt(message: &str) -> String {
@@ -243,15 +568,8 @@ fn prompt(message: &str) -> String {
     line.trim().to_string()
 }
 
-fn pause() {
-    print!("\npress enter to close...");
-    let _ = io::stdout().flush();
-    let mut line = String::new();
-    let _ = io::stdin().read_line(&mut line);
-}
-
-/// Run a command; on failure call `on_err` (which never returns).
-fn run_or(mut cmd: Command, what: &str, on_err: fn(&str) -> !) {
+fn run_or(cmd: Command, what: &str, on_err: fn(&str) -> !) {
+    let mut cmd = cmd;
     match cmd.status() {
         Ok(status) if status.success() => {}
         Ok(status) => on_err(&format!("{what} failed (exit {})", status.code().unwrap_or(-1))),
@@ -259,21 +577,24 @@ fn run_or(mut cmd: Command, what: &str, on_err: fn(&str) -> !) {
     }
 }
 
-/// Interactive failure (in a pane): show the error, wait, then exit non-zero.
+fn run(mut cmd: Command) -> bool {
+    matches!(cmd.status(), Ok(status) if status.success())
+}
+
 fn fail(message: &str) -> ! {
     eprintln!("error: {message}");
-    pause();
+    print!("\npress enter to close...");
+    let _ = io::stdout().flush();
+    let mut line = String::new();
+    let _ = io::stdin().read_line(&mut line);
     process::exit(1);
 }
 
-/// Headless failure (in an action): error to the plugin log, exit non-zero.
 fn die(message: &str) -> ! {
     eprintln!("error: {message}");
     process::exit(1);
 }
 
-/// Minimal string-field extractor for the flat HERDR_PLUGIN_CONTEXT_JSON object.
-/// Mirrors the approach in herdr's own rust-release-check example (no serde dep).
 fn json_string_field(json: &str, key: &str) -> Option<String> {
     let needle = format!("\"{key}\"");
     let after_key = json.split_once(&needle)?.1;
