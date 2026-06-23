@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Headless action (triggered by `prefix+J` inside a jj workspace): run
+# Headless action (triggered by `prefix+ctrl+j` inside a jj workspace): run
 # `jj workspace forget`, delete the directory, and close the Herdr workspace.
 # The main workspace is never removed. Output goes to `herdr plugin log list`.
 set -euo pipefail
