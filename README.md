@@ -2,7 +2,7 @@
 
 A [Herdr](https://herdr.dev) plugin to create and destroy [Jujutsu](https://jj-vcs.github.io/jj/) (`jj`) workspaces with one keypress. Requires `jj` and `jq` on your `PATH`.
 
-## install
+## Install
 
 ```sh
 herdr plugin install NathanFlurry/herdr-plugin-jj-workspace
@@ -10,7 +10,7 @@ herdr plugin install NathanFlurry/herdr-plugin-jj-workspace
 
 For local development, link a checkout instead: `herdr plugin link .`
 
-## keybindings
+## Keybindings
 
 Actions aren't bound by default. Add to your Herdr keybindings config:
 
@@ -28,18 +28,18 @@ command = "nathanflurry.jj-workspace.remove"
 description = "remove jj workspace"
 ```
 
-## quickstart
+## Quickstart
 
-### create workspace
+### Create workspace
 
 Press `prefix+j`, type a name. Runs `jj workspace add` and opens the new
 workspace as a focused Herdr workspace.
 
-### destroy workspace
+### Destroy workspace
 
 Press `prefix+J` inside a jj workspace. Runs `jj workspace forget`, deletes the
 directory, and closes the Herdr workspace. The main workspace is never removed.
 
-## license
+## License
 
 MIT — see [LICENSE](LICENSE).
