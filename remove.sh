@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Headless action: jj forget + delete dir + close the Herdr workspace.
-# Output goes to `herdr plugin log list` (no TTY here).
+# Headless action (triggered by `prefix+J` inside a jj workspace): run
+# `jj workspace forget`, delete the directory, and close the Herdr workspace.
+# The main workspace is never removed. Output goes to `herdr plugin log list`.
 set -euo pipefail
 
 herdr_bin="${HERDR_BIN_PATH:-herdr}"
