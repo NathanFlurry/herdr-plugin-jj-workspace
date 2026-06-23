@@ -98,15 +98,25 @@ fn cmd_wizard() -> ! {
     };
 
     let slug = branch_to_path_slug(&branch);
-    let dest = root.join(&repo_name).join(&slug);
-    if dest.exists() {
-        fail(&format!("checkout already exists: {}", dest.display()));
+    let dest_path = root.join(&repo_name).join(&slug);
+    if dest_path.exists() {
+        fail(&format!("checkout already exists: {}", dest_path.display()));
     }
-    let dest = dest.display().to_string();
+    // jj workspace add does not create intermediate dirs (Herdr create_dir_all's
+    // the parent before `git worktree add` for the same reason).
+    if let Some(parent) = dest_path.parent() {
+        if let Err(err) = fs::create_dir_all(parent) {
+            fail(&format!("could not create {}: {err}", parent.display()));
+        }
+    }
+    let dest = dest_path.display().to_string();
 
-    eprintln!("+ jj workspace add --name {slug} {dest}");
+    // Herdr's convention: branch is `worktree/foo`, the workspace is `foo`.
+    let ws_name = branch.rsplit('/').next().unwrap_or(&branch).to_string();
+
+    eprintln!("+ jj workspace add --name {ws_name} {dest}");
     let mut add = Command::new("jj");
-    add.current_dir(&repo).args(["workspace", "add", "--name", &slug, &dest]);
+    add.current_dir(&repo).args(["workspace", "add", "--name", &ws_name, &dest]);
     run_or(add, "jj workspace add", fail);
 
     // Mirror Herdr's worktree branch with a jj bookmark of the same name (non-fatal).
@@ -215,7 +225,10 @@ fn run_wizard(repo_name: &str, root: &Path, initial: String) -> io::Result<Optio
     execute!(out, EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
 
+    // The generated name is prefilled but acts as a placeholder: the first edit
+    // replaces it wholesale (mirrors herdr's `name_input_replace_on_type`).
     let mut name = initial;
+    let mut replace_on_type = true;
     let mut error: Option<String> = None;
     let outcome = loop {
         let _ = terminal.draw(|frame| draw_wizard(frame, &name, repo_name, root, error.as_deref()));
@@ -230,10 +243,19 @@ fn run_wizard(repo_name: &str, root: &Path, initial: String) -> io::Result<Optio
                     error = Some("branch must match [A-Za-z0-9._/-]".into());
                 }
                 KeyCode::Backspace => {
-                    name.pop();
+                    if replace_on_type {
+                        name.clear();
+                        replace_on_type = false;
+                    } else {
+                        name.pop();
+                    }
                     error = None;
                 }
                 KeyCode::Char(c) => {
+                    if replace_on_type {
+                        name.clear();
+                        replace_on_type = false;
+                    }
                     name.push(c);
                     error = None;
                 }
