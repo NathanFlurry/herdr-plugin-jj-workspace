@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs inside a Herdr overlay pane (has a TTY -> can prompt).
 #
-# Flow (triggered by `prefix+shift+j`): prompt for a name, run `jj workspace add`, then
+# Flow (triggered by `prefix+ctrl+j`): prompt for a name, run `jj workspace add`, then
 # open the new workspace as a focused Herdr workspace. New workspaces land under
 # $JJ_WORKSPACE_ROOT if set, otherwise next to the repo as "<repo>.<name>".
 # The repo path arrives as $JJ_REPO from open-new.sh.
