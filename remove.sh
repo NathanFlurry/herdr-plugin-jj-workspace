@@ -5,7 +5,8 @@
 set -euo pipefail
 
 herdr_bin="${HERDR_BIN_PATH:-herdr}"
-ctx="${HERDR_PLUGIN_CONTEXT_JSON:-{}}"
+ctx="${HERDR_PLUGIN_CONTEXT_JSON:-}"
+[ -n "$ctx" ] || ctx='{}'
 ws="${HERDR_WORKSPACE_ID:-}"
 cwd=""
 if command -v jq >/dev/null 2>&1; then
