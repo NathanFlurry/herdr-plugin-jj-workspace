@@ -87,7 +87,7 @@ fn cmd_wizard() -> ! {
     }
 
     let repo_name = basename(&repo);
-    let root = worktrees_root();
+    let root = workspaces_root();
     let default_branch = generated_name(seed());
 
     // Run the ported worktree modal; None = the user pressed esc.
@@ -111,12 +111,11 @@ fn cmd_wizard() -> ! {
     }
     let dest = dest_path.display().to_string();
 
-    // Herdr's convention: branch is `worktree/foo`, the workspace is `foo`.
-    let ws_name = branch.rsplit('/').next().unwrap_or(&branch).to_string();
-
-    eprintln!("+ jj workspace add --name {ws_name} {dest}");
+    // jj allows a slash in workspace names, so keep the full `workspace/<name>`
+    // for both the workspace and the bookmark.
+    eprintln!("+ jj workspace add --name {branch} {dest}");
     let mut add = Command::new("jj");
-    add.current_dir(&repo).args(["workspace", "add", "--name", &ws_name, &dest]);
+    add.current_dir(&repo).args(["workspace", "add", "--name", &branch, &dest]);
     run_or(add, "jj workspace add", fail);
 
     // Mirror Herdr's worktree branch with a jj bookmark of the same name (non-fatal).
@@ -305,7 +304,7 @@ fn draw_wizard(frame: &mut Frame, name: &str, repo_name: &str, root: &Path, erro
 
     render_modal_header(frame, rows[0], "new jj workspace", &p);
 
-    frame.render_widget(Paragraph::new(" branch").style(Style::default().fg(p.overlay0)), rows[1]);
+    frame.render_widget(Paragraph::new(" workspace").style(Style::default().fg(p.overlay0)), rows[1]);
     let input_rect = Rect::new(rows[2].x, rows[2].y, rows[2].width, 1);
     frame.render_widget(Clear, input_rect);
     frame.render_widget(
@@ -448,7 +447,7 @@ fn generated_name(seed: u64) -> String {
     let adjective = ADJECTIVES[(seed as usize) % ADJECTIVES.len()];
     let noun = NOUNS[((seed / ADJECTIVES.len() as u64) as usize) % NOUNS.len()];
     let suffix = seed & 0xffff;
-    format!("worktree/{adjective}-{noun}-{suffix:04x}")
+    format!("workspace/{adjective}-{noun}-{suffix:04x}")
 }
 
 fn branch_to_path_slug(branch: &str) -> String {
@@ -465,7 +464,7 @@ fn branch_to_path_slug(branch: &str) -> String {
     }
     let trimmed = slug.trim_matches('-').to_string();
     if trimmed.is_empty() {
-        "worktree".into()
+        "workspace".into()
     } else {
         trimmed
     }
@@ -478,43 +477,12 @@ fn seed() -> u64 {
         .unwrap_or(0)
 }
 
-/// Checkout root: $JJ_WORKSPACE_ROOT override > Herdr `[worktrees].directory` > ~/.herdr/worktrees.
-fn worktrees_root() -> PathBuf {
+/// Checkout root: $JJ_WORKSPACE_ROOT override, else ~/.herdr/workspaces.
+fn workspaces_root() -> PathBuf {
     if let Some(root) = config_value("JJ_WORKSPACE_ROOT") {
         return PathBuf::from(expand_tilde(root.trim_end_matches('/')));
     }
-    if let Some(dir) = herdr_worktrees_dir() {
-        return PathBuf::from(expand_tilde(&dir));
-    }
-    PathBuf::from(expand_tilde("~/.herdr/worktrees"))
-}
-
-fn herdr_worktrees_dir() -> Option<String> {
-    let base = env::var("XDG_CONFIG_HOME")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| env::var("HOME").ok().map(|h| Path::new(&h).join(".config")))?;
-    let content = fs::read_to_string(base.join("herdr").join("config.toml")).ok()?;
-    let mut in_worktrees = false;
-    for line in content.lines() {
-        let line = line.trim();
-        if line.starts_with('[') {
-            in_worktrees = line == "[worktrees]";
-            continue;
-        }
-        if in_worktrees {
-            if let Some((key, value)) = line.split_once('=') {
-                if key.trim() == "directory" {
-                    let value = value.trim().trim_matches('"').trim_matches('\'');
-                    if !value.is_empty() {
-                        return Some(value.to_string());
-                    }
-                }
-            }
-        }
-    }
-    None
+    PathBuf::from(expand_tilde("~/.herdr/workspaces"))
 }
 
 fn expand_tilde(path: &str) -> String {
