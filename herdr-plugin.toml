@@ -2,27 +2,38 @@ id = "nathanflurry.jj-workspace"
 name = "jj workspaces"
 version = "0.1.0"
 min_herdr_version = "0.7.0"
-description = "Create and remove Jujutsu (jj) workspaces as Herdr workspaces."
+description = "Create and remove Jujutsu (jj) workspaces as Herdr workspaces or tabs."
 platforms = ["linux", "macos"]
 
-# Bindable action -> resolves the focused repo, then opens the create pane.
-# Actions run headless (no TTY), so the name prompt has to live in a pane.
+# Built at install time (needs cargo). `plugin link` does not build, so local
+# devs run `cargo build --release` themselves.
+[[build]]
+command = ["cargo", "build", "--release"]
+
+# Open a new jj workspace as a new Herdr workspace.
 [[actions]]
 id = "new"
 title = "New jj workspace"
 contexts = ["workspace", "global"]
-command = ["bash", "open-new.sh"]
+command = ["./target/release/jj-workspace", "open", "workspace"]
 
-# The pane the action opens: a real terminal, so it can prompt for a name.
+# Open a new jj workspace as a new tab in the current workspace.
+[[actions]]
+id = "new-tab"
+title = "New jj workspace (in tab)"
+contexts = ["workspace", "global"]
+command = ["./target/release/jj-workspace", "open", "tab"]
+
+# Interactive wizard the actions above open (prompts for a name in a pane).
 [[panes]]
-id = "new"
+id = "wizard"
 title = "New jj workspace"
 placement = "overlay"
-command = ["bash", "new-pane.sh"]
+command = ["./target/release/jj-workspace", "wizard"]
 
-# Teardown: no prompt needed, so a plain headless action.
+# Remove the focused jj workspace.
 [[actions]]
 id = "remove"
 title = "Remove jj workspace"
 contexts = ["workspace"]
-command = ["bash", "remove.sh"]
+command = ["./target/release/jj-workspace", "remove"]

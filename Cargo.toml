@@ -1,0 +1,13 @@
+[package]
+name = "jj-workspace"
+version = "0.1.0"
+edition = "2021"
+
+# No external dependencies: install-time `cargo build --release` stays fast and
+# offline. JSON from HERDR_PLUGIN_CONTEXT_JSON is parsed with a tiny helper.
+[dependencies]
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
