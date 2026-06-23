@@ -12,17 +12,18 @@ A [Herdr](https://herdr.dev) plugin to create and destroy [Jujutsu](https://jj-v
 
    For local development, link a checkout instead: `herdr plugin link .`
 
-2. Bind keys in your Herdr keybindings config:
+2. Bind keys in your Herdr keybindings config. These are direct chords (no
+   leader) — handy if your prefix is already a `ctrl` chord:
 
    ```toml
    [[keys.command]]
-   key = "prefix+ctrl+j"
+   key = "ctrl+alt+j"
    type = "plugin_action"
    command = "nathanflurry.jj-workspace.new"
    description = "new jj workspace"
 
    [[keys.command]]
-   key = "prefix+ctrl+x"
+   key = "ctrl+alt+x"
    type = "plugin_action"
    command = "nathanflurry.jj-workspace.remove"
    description = "remove jj workspace"
@@ -30,8 +31,8 @@ A [Herdr](https://herdr.dev) plugin to create and destroy [Jujutsu](https://jj-v
 
 ## Quickstart
 
-- `prefix+ctrl+j` — create a workspace (prompts for a name)
-- `prefix+ctrl+x` — destroy the current workspace
+- `ctrl+alt+j` — create a workspace (prompts for a name)
+- `ctrl+alt+x` — destroy the current workspace
 
 Replaces the manual `new tab → jj workspace add → cd` dance.
 
