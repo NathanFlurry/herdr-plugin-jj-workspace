@@ -24,7 +24,7 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Layout, Rect},
+    layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
     symbols,
     text::{Line, Span},
@@ -55,12 +55,20 @@ fn cmd_open(mode: &str) -> ! {
         .unwrap_or_default();
 
     let mut cmd = Command::new(herdr_bin());
-    cmd.args(["plugin", "pane", "open", "--plugin", &plugin_id(), "--entrypoint", "wizard"])
-        .arg("--env")
-        .arg(format!("JJ_REPO={repo}"))
-        .arg("--env")
-        .arg(format!("JJ_OPEN={mode}"))
-        .arg("--focus");
+    cmd.args([
+        "plugin",
+        "pane",
+        "open",
+        "--plugin",
+        &plugin_id(),
+        "--entrypoint",
+        "wizard",
+    ])
+    .arg("--env")
+    .arg(format!("JJ_REPO={repo}"))
+    .arg("--env")
+    .arg(format!("JJ_OPEN={mode}"))
+    .arg("--focus");
     match cmd.status() {
         Ok(status) => process::exit(status.code().unwrap_or(0)),
         Err(err) => {
@@ -88,16 +96,24 @@ fn cmd_wizard() -> ! {
 
     let repo_name = basename(&repo);
     let root = workspaces_root();
-    let default_branch = generated_name(seed());
+    let default_name = generated_name(seed());
+    let bookmarks = match load_bookmarks(&repo) {
+        Ok(bookmarks) if !bookmarks.is_empty() => bookmarks,
+        Ok(_) => fail("no jj bookmarks found to base the workspace on"),
+        Err(err) => fail(&err),
+    };
 
     // Run the ported worktree modal; None = the user pressed esc.
-    let branch = match run_wizard(&repo_name, &root, default_branch) {
-        Ok(Some(branch)) => branch,
+    let WizardOutcome {
+        workspace_name,
+        base_revset,
+    } = match run_wizard(&repo_name, &root, default_name, bookmarks) {
+        Ok(Some(outcome)) => outcome,
         Ok(None) => process::exit(0),
         Err(err) => fail(&format!("terminal error: {err}")),
     };
 
-    let slug = branch_to_path_slug(&branch);
+    let slug = workspace_name_to_path_slug(&workspace_name);
     let dest_path = root.join(&repo_name).join(&slug);
     if dest_path.exists() {
         fail(&format!("checkout already exists: {}", dest_path.display()));
@@ -111,31 +127,33 @@ fn cmd_wizard() -> ! {
     }
     let dest = dest_path.display().to_string();
 
-    // jj allows a slash in workspace names, so keep the full `workspace/<name>`
-    // for both the workspace and the bookmark.
-    eprintln!("+ jj workspace add --name {branch} {dest}");
+    // Base the new workspace's working-copy commit on the selected bookmark.
+    eprintln!("+ jj workspace add --name {workspace_name} --revision {base_revset} {dest}");
     let mut add = Command::new("jj");
-    add.current_dir(&repo).args(["workspace", "add", "--name", &branch, &dest]);
+    add.current_dir(&repo).args([
+        "workspace",
+        "add",
+        "--name",
+        &workspace_name,
+        "--revision",
+        &base_revset,
+        &dest,
+    ]);
     run_or(add, "jj workspace add", fail);
 
-    // Mirror Herdr's worktree branch with a jj bookmark of the same name (non-fatal).
-    let mut bookmark = Command::new("jj");
-    bookmark.current_dir(&dest).args(["bookmark", "create", &branch, "-r", "@"]);
-    if !run(bookmark) {
-        eprintln!("warning: could not create bookmark {branch} (workspace still created)");
-    }
-
-    let herdr = herdr_bin();
-    let mut open = Command::new(&herdr);
-    if mode == "tab" {
-        eprintln!("+ herdr tab create --cwd {dest}");
-        open.args(["tab", "create", "--cwd", &dest, "--label", &branch, "--focus"]);
-        run_or(open, "herdr tab create", fail);
-    } else {
-        eprintln!("+ herdr workspace create --cwd {dest}");
-        open.args(["workspace", "create", "--cwd", &dest, "--label", &branch, "--focus"]);
-        run_or(open, "herdr workspace create", fail);
-    }
+    let target = if mode == "tab" { "tab" } else { "workspace" };
+    eprintln!("+ herdr {target} create --cwd {dest}");
+    let mut open = Command::new(herdr_bin());
+    open.args([
+        target,
+        "create",
+        "--cwd",
+        &dest,
+        "--label",
+        &workspace_name,
+        "--focus",
+    ]);
+    run_or(open, &format!("herdr {target} create"), fail);
     process::exit(0);
 }
 
@@ -164,10 +182,16 @@ fn cmd_remove() -> ! {
     // The MAIN workspace stores .jj/repo as a directory; a secondary workspace
     // stores it as a file pointer. Never remove the main workspace.
     if canon.join(".jj").join("repo").is_dir() {
-        die(&format!("refusing to remove the MAIN jj workspace ({})", canon.display()));
+        die(&format!(
+            "refusing to remove the MAIN jj workspace ({})",
+            canon.display()
+        ));
     }
     if canon == Path::new("/") || canon.parent().is_none() {
-        die(&format!("refusing to remove unsafe path: {}", canon.display()));
+        die(&format!(
+            "refusing to remove unsafe path: {}",
+            canon.display()
+        ));
     }
 
     let mut forget = Command::new("jj");
@@ -217,8 +241,18 @@ fn catppuccin() -> Palette {
     }
 }
 
-/// Returns Some(branch) on "create and open", None on cancel (esc / ctrl-c).
-fn run_wizard(repo_name: &str, root: &Path, initial: String) -> io::Result<Option<String>> {
+struct WizardOutcome {
+    workspace_name: String,
+    base_revset: String,
+}
+
+/// Returns Some(outcome) on "create and open", None on cancel (esc / ctrl-c).
+fn run_wizard(
+    repo_name: &str,
+    root: &Path,
+    initial: String,
+    bookmarks: Vec<String>,
+) -> io::Result<Option<WizardOutcome>> {
     enable_raw_mode()?;
     let mut out = io::stdout();
     execute!(out, EnterAlternateScreen)?;
@@ -228,18 +262,62 @@ fn run_wizard(repo_name: &str, root: &Path, initial: String) -> io::Result<Optio
     // replaces it wholesale (mirrors herdr's `name_input_replace_on_type`).
     let mut name = initial;
     let mut replace_on_type = true;
+    let mut selected_bookmark = 0usize;
     let mut error: Option<String> = None;
     let outcome = loop {
-        let _ = terminal.draw(|frame| draw_wizard(frame, &name, repo_name, root, error.as_deref()));
+        let _ = terminal.draw(|frame| {
+            draw_wizard(
+                frame,
+                &name,
+                repo_name,
+                root,
+                &bookmarks,
+                selected_bookmark,
+                error.as_deref(),
+            )
+        });
         match event::read() {
             Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => match key.code {
                 KeyCode::Esc => break None,
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break None,
                 KeyCode::Enter => {
-                    if valid_branch(&name) {
-                        break Some(name.clone());
+                    if bookmarks.is_empty() {
+                        error = Some("select a base bookmark".into());
+                    } else if valid_workspace_name(&name) {
+                        break Some(WizardOutcome {
+                            workspace_name: name.clone(),
+                            base_revset: bookmarks[selected_bookmark].clone(),
+                        });
+                    } else {
+                        error = Some("workspace name must match [A-Za-z0-9._/-]".into());
                     }
-                    error = Some("branch must match [A-Za-z0-9._/-]".into());
+                }
+                KeyCode::Up => {
+                    selected_bookmark = selected_bookmark.saturating_sub(1);
+                    error = None;
+                }
+                KeyCode::Down => {
+                    if selected_bookmark + 1 < bookmarks.len() {
+                        selected_bookmark += 1;
+                    }
+                    error = None;
+                }
+                KeyCode::PageUp => {
+                    selected_bookmark = selected_bookmark.saturating_sub(5);
+                    error = None;
+                }
+                KeyCode::PageDown => {
+                    selected_bookmark =
+                        (selected_bookmark + 5).min(bookmarks.len().saturating_sub(1));
+                    error = None;
+                }
+                KeyCode::Home => {
+                    selected_bookmark = 0;
+                    error = None;
+                }
+                KeyCode::End => {
+                    selected_bookmark = bookmarks.len().saturating_sub(1);
+                    error = None;
                 }
                 KeyCode::Backspace => {
                     if replace_on_type {
@@ -278,54 +356,87 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io
     Ok(())
 }
 
-/// Mirrors herdr's `render_new_linked_worktree_overlay`.
-fn draw_wizard(frame: &mut Frame, name: &str, repo_name: &str, root: &Path, error: Option<&str>) {
+/// Mirrors herdr's `render_new_linked_worktree_overlay`, with a bookmark picker.
+fn draw_wizard(
+    frame: &mut Frame,
+    name: &str,
+    repo_name: &str,
+    root: &Path,
+    bookmarks: &[String],
+    selected_bookmark: usize,
+    error: Option<&str>,
+) {
     let p = catppuccin();
     let area = frame.area();
     dim_background(frame, area);
-    let Some(inner) = render_modal_shell(frame, area, 68, 10, &p) else {
+    let Some(inner) = render_modal_shell(frame, area, 76, 18, &p) else {
         return;
     };
-    if inner.height < 7 {
+    if inner.height < 12 {
         return;
     }
 
-    let rows = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Min(0),
-    ])
-    .areas::<8>(inner);
+    let list_height = inner.height.saturating_sub(11).max(1).min(5);
+    let checkout_label_y = 7 + list_height;
+    let checkout_value_y = 8 + list_height;
+    let status_y = inner.height.saturating_sub(2);
+    let line = |offset: u16| Rect::new(inner.x, inner.y + offset, inner.width, 1);
+    render_modal_header(frame, line(0), "new jj workspace", &p);
 
-    render_modal_header(frame, rows[0], "new jj workspace", &p);
-
-    frame.render_widget(Paragraph::new(" workspace").style(Style::default().fg(p.overlay0)), rows[1]);
-    let input_rect = Rect::new(rows[2].x, rows[2].y, rows[2].width, 1);
+    frame.render_widget(
+        Paragraph::new(" workspace").style(Style::default().fg(p.overlay0)),
+        line(2),
+    );
+    let input_rect = line(3);
     frame.render_widget(Clear, input_rect);
     frame.render_widget(
-        Paragraph::new(format!(" {name}█"))
-            .style(Style::default().fg(p.text).bg(p.surface0)),
+        Paragraph::new(format!(" {name}█")).style(Style::default().fg(p.text).bg(p.surface0)),
         input_rect,
     );
 
-    let checkout = root.join(repo_name).join(branch_to_path_slug(name)).display().to_string();
-    frame.render_widget(Paragraph::new(" checkout").style(Style::default().fg(p.overlay0)), rows[3]);
+    let selected = selected_bookmark.min(bookmarks.len().saturating_sub(1));
+    let base_label = if bookmarks.is_empty() {
+        " base bookmark".to_string()
+    } else {
+        format!(" base bookmark ({}/{})  ↑/↓", selected + 1, bookmarks.len())
+    };
     frame.render_widget(
-        Paragraph::new(format!(" {checkout}")).style(Style::default().fg(p.subtext0)),
-        rows[4],
+        Paragraph::new(base_label).style(Style::default().fg(p.overlay0)),
+        line(5),
+    );
+    render_bookmark_list(
+        frame,
+        Rect::new(inner.x, inner.y + 6, inner.width, list_height),
+        bookmarks,
+        selected,
+        &p,
     );
 
-    if let Some(error) = error {
-        frame.render_widget(
-            Paragraph::new(format!(" {error}")).style(Style::default().fg(p.red)),
-            rows[5],
-        );
-    }
+    let checkout = root
+        .join(repo_name)
+        .join(workspace_name_to_path_slug(name))
+        .display()
+        .to_string();
+    frame.render_widget(
+        Paragraph::new(" checkout").style(Style::default().fg(p.overlay0)),
+        line(checkout_label_y),
+    );
+    frame.render_widget(
+        Paragraph::new(format!(
+            " {}",
+            fit_text(&checkout, inner.width.saturating_sub(1))
+        ))
+        .style(Style::default().fg(p.subtext0)),
+        line(checkout_value_y),
+    );
+
+    let status = if let Some(error) = error {
+        Paragraph::new(format!(" {error}")).style(Style::default().fg(p.red))
+    } else {
+        Paragraph::new(" enter: create  esc: cancel  arrows: change base bookmark")
+            .style(Style::default().fg(p.overlay0))
+    };
+    frame.render_widget(status, line(status_y));
 
     let (create_rect, cancel_rect) = button_rects(inner);
     render_action_button(
@@ -348,6 +459,75 @@ fn draw_wizard(frame: &mut Frame, name: &str, repo_name: &str, root: &Path, erro
             .bg(p.surface0)
             .add_modifier(Modifier::BOLD),
     );
+}
+
+fn render_bookmark_list(
+    frame: &mut Frame,
+    area: Rect,
+    bookmarks: &[String],
+    selected_bookmark: usize,
+    p: &Palette,
+) {
+    frame.render_widget(Clear, area);
+    if bookmarks.is_empty() {
+        frame.render_widget(
+            Paragraph::new(" no bookmarks found").style(Style::default().fg(p.red)),
+            Rect::new(area.x, area.y, area.width, 1),
+        );
+        return;
+    }
+
+    let visible_rows = area.height as usize;
+    let selected = selected_bookmark.min(bookmarks.len() - 1);
+    let mut start = selected.saturating_sub(visible_rows / 2);
+    if start + visible_rows > bookmarks.len() {
+        start = bookmarks.len().saturating_sub(visible_rows);
+    }
+
+    for row in 0..visible_rows {
+        let idx = start + row;
+        if idx >= bookmarks.len() {
+            break;
+        }
+        let selected_row = idx == selected;
+        let marker = if selected_row { "›" } else { " " };
+        let more_marker = if row == 0 && start > 0 {
+            "↑"
+        } else if row + 1 == visible_rows && idx + 1 < bookmarks.len() {
+            "↓"
+        } else {
+            marker
+        };
+        let text = fit_text(&format!(" {more_marker} {}", bookmarks[idx]), area.width);
+        let style = if selected_row {
+            Style::default()
+                .fg(panel_contrast_fg(p))
+                .bg(p.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(p.text).bg(p.surface0)
+        };
+        frame.render_widget(
+            Paragraph::new(text).style(style),
+            Rect::new(area.x, area.y + row as u16, area.width, 1),
+        );
+    }
+}
+
+fn fit_text(text: &str, width: u16) -> String {
+    let max = width as usize;
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    if max == 1 {
+        return "…".into();
+    }
+    let mut out: String = text.chars().take(max - 1).collect();
+    out.push('…');
+    out
 }
 
 // Ported verbatim from herdr's src/ui/widgets.rs / src/ui.rs.
@@ -401,9 +581,17 @@ fn render_modal_header(frame: &mut Frame, area: Rect, title: &str, p: &Palette) 
     frame.render_widget(Paragraph::new(line), area);
 }
 
-fn render_action_button(frame: &mut Frame, rect: Rect, hint: Option<&str>, label: &str, style: Style) {
+fn render_action_button(
+    frame: &mut Frame,
+    rect: Rect,
+    hint: Option<&str>,
+    label: &str,
+    style: Style,
+) {
     frame.render_widget(
-        Paragraph::new(action_button_text(hint, label)).style(style).alignment(Alignment::Center),
+        Paragraph::new(action_button_text(hint, label))
+            .style(style)
+            .alignment(Alignment::Center),
         rect,
     );
 }
@@ -424,7 +612,9 @@ fn panel_contrast_fg(p: &Palette) -> Color {
 
 /// Herdr's `new_linked_worktree_button_rects`: a centered "create / cancel" row.
 fn button_rects(inner: Rect) -> (Rect, Rect) {
-    let create = action_button_text(Some("↵"), "create and open").chars().count() as u16;
+    let create = action_button_text(Some("↵"), "create and open")
+        .chars()
+        .count() as u16;
     let cancel = action_button_text(Some("esc"), "cancel").chars().count() as u16;
     let gap = 2u16;
     let total = create + cancel + gap;
@@ -438,10 +628,12 @@ fn button_rects(inner: Rect) -> (Rect, Rect) {
 
 // --- naming (mirrors src/worktree.rs in herdr) -----------------------------
 
-const ADJECTIVES: [&str; 8] =
-    ["brave", "calm", "clear", "green", "lucky", "quiet", "rapid", "silver"];
-const NOUNS: [&str; 8] =
-    ["river", "cloud", "field", "forest", "harbor", "meadow", "stone", "valley"];
+const ADJECTIVES: [&str; 8] = [
+    "brave", "calm", "clear", "green", "lucky", "quiet", "rapid", "silver",
+];
+const NOUNS: [&str; 8] = [
+    "river", "cloud", "field", "forest", "harbor", "meadow", "stone", "valley",
+];
 
 fn generated_name(seed: u64) -> String {
     let adjective = ADJECTIVES[(seed as usize) % ADJECTIVES.len()];
@@ -450,10 +642,10 @@ fn generated_name(seed: u64) -> String {
     format!("workspace/{adjective}-{noun}-{suffix:04x}")
 }
 
-fn branch_to_path_slug(branch: &str) -> String {
+fn workspace_name_to_path_slug(name: &str) -> String {
     let mut slug = String::new();
     let mut last_was_dash = false;
-    for ch in branch.chars() {
+    for ch in name.chars() {
         if ch.is_ascii_alphanumeric() {
             slug.push(ch.to_ascii_lowercase());
             last_was_dash = false;
@@ -496,8 +688,65 @@ fn expand_tilde(path: &str) -> String {
 
 // --- helpers ---------------------------------------------------------------
 
+fn load_bookmarks(repo: &str) -> Result<Vec<String>, String> {
+    let template = r#"name ++ "\t" ++ if(remote, remote, "") ++ "\0""#;
+    let output = Command::new("jj")
+        .current_dir(repo)
+        .args([
+            "--color",
+            "never",
+            "--no-pager",
+            "bookmark",
+            "list",
+            "--all-remotes",
+            "-T",
+            template,
+        ])
+        .output()
+        .map_err(|err| format!("jj bookmark list failed to start: {err}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let details = stderr.trim();
+        if details.is_empty() {
+            return Err(format!(
+                "jj bookmark list failed (exit {})",
+                output.status.code().unwrap_or(-1)
+            ));
+        }
+        return Err(format!("jj bookmark list failed: {details}"));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut bookmarks = Vec::new();
+    for entry in stdout.split('\0') {
+        if entry.is_empty() {
+            continue;
+        }
+        let (name, remote) = entry.split_once('\t').unwrap_or((entry, ""));
+        let name = name.trim();
+        let remote = remote.trim();
+        if name.is_empty() || remote == "git" {
+            continue;
+        }
+        let label = if remote.is_empty() {
+            name.to_string()
+        } else {
+            format!("{name}@{remote}")
+        };
+        if bookmarks.contains(&label) {
+            continue;
+        }
+        bookmarks.push(label);
+    }
+    Ok(bookmarks)
+}
+
 fn herdr_bin() -> String {
-    env::var("HERDR_BIN_PATH").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "herdr".into())
+    env::var("HERDR_BIN_PATH")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "herdr".into())
 }
 
 fn plugin_id() -> String {
@@ -511,13 +760,19 @@ fn is_jj_workspace(repo: &str) -> bool {
     !repo.is_empty() && Path::new(repo).join(".jj").exists()
 }
 
-fn valid_branch(branch: &str) -> bool {
-    !branch.is_empty()
-        && branch.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
+fn valid_workspace_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
 }
 
 fn basename(path: &str) -> String {
-    Path::new(path).file_name().and_then(|s| s.to_str()).unwrap_or("repo").to_string()
+    Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("repo")
+        .to_string()
 }
 
 fn config_value(key: &str) -> Option<String> {
@@ -547,7 +802,9 @@ fn config_value(key: &str) -> Option<String> {
 
 fn which(cmd: &str) -> Option<()> {
     let paths = env::var_os("PATH")?;
-    env::split_paths(&paths).find(|dir| dir.join(cmd).is_file()).map(|_| ())
+    env::split_paths(&paths)
+        .find(|dir| dir.join(cmd).is_file())
+        .map(|_| ())
 }
 
 fn prompt(message: &str) -> String {
@@ -562,13 +819,12 @@ fn run_or(cmd: Command, what: &str, on_err: fn(&str) -> !) {
     let mut cmd = cmd;
     match cmd.status() {
         Ok(status) if status.success() => {}
-        Ok(status) => on_err(&format!("{what} failed (exit {})", status.code().unwrap_or(-1))),
+        Ok(status) => on_err(&format!(
+            "{what} failed (exit {})",
+            status.code().unwrap_or(-1)
+        )),
         Err(err) => on_err(&format!("{what} failed to start: {err}")),
     }
-}
-
-fn run(mut cmd: Command) -> bool {
-    matches!(cmd.status(), Ok(status) if status.success())
 }
 
 fn fail(message: &str) -> ! {
