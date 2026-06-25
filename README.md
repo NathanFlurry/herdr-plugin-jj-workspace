@@ -42,9 +42,11 @@ A [Herdr](https://herdr.dev) plugin to create and remove [Jujutsu](https://jj-vc
 
 ## Quickstart
 
-- `prefix+a` — create a workspace (prompts for a name and base bookmark), open as a new **workspace**
+- `prefix+a` — create a workspace (prompts for a name and searchable base bookmark), open as a new **workspace**
 - `prefix+shift+a` — same, but open in a new **tab**
 - `prefix+d` — destroy the current workspace
+
+In the create dialog, press `tab` or `ctrl+f` to search bookmarks, then use arrows to pick the filtered base bookmark.
 
 New workspaces are based on the selected jj bookmark and do not create a new bookmark.
 Replaces the manual `new tab → jj workspace add -r <bookmark> → cd` dance.

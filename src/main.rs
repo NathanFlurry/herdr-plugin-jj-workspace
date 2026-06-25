@@ -246,6 +246,24 @@ struct WizardOutcome {
     base_revset: String,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WizardFocus {
+    WorkspaceName,
+    BookmarkSearch,
+}
+
+struct WizardView<'a> {
+    name: &'a str,
+    repo_name: &'a str,
+    root: &'a Path,
+    bookmarks: &'a [String],
+    bookmark_query: &'a str,
+    matching_indices: &'a [usize],
+    selected_match: usize,
+    focus: WizardFocus,
+    error: Option<&'a str>,
+}
+
 /// Returns Some(outcome) on "create and open", None on cancel (esc / ctrl-c).
 fn run_wizard(
     repo_name: &str,
@@ -262,78 +280,125 @@ fn run_wizard(
     // replaces it wholesale (mirrors herdr's `name_input_replace_on_type`).
     let mut name = initial;
     let mut replace_on_type = true;
-    let mut selected_bookmark = 0usize;
+    let mut bookmark_query = String::new();
+    let mut focus = WizardFocus::WorkspaceName;
+    let mut selected_match = 0usize;
     let mut error: Option<String> = None;
     let outcome = loop {
+        let matching_indices = matching_bookmark_indices(&bookmarks, &bookmark_query);
+        let match_count = matching_indices.len();
+        if selected_match >= match_count {
+            selected_match = match_count.saturating_sub(1);
+        }
+
         let _ = terminal.draw(|frame| {
             draw_wizard(
                 frame,
-                &name,
-                repo_name,
-                root,
-                &bookmarks,
-                selected_bookmark,
-                error.as_deref(),
+                WizardView {
+                    name: &name,
+                    repo_name,
+                    root,
+                    bookmarks: &bookmarks,
+                    bookmark_query: &bookmark_query,
+                    matching_indices: &matching_indices,
+                    selected_match,
+                    focus,
+                    error: error.as_deref(),
+                },
             )
         });
         match event::read() {
             Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => match key.code {
                 KeyCode::Esc => break None,
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break None,
+                KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    focus = WizardFocus::BookmarkSearch;
+                    error = None;
+                }
+                KeyCode::Tab | KeyCode::BackTab => {
+                    focus = match focus {
+                        WizardFocus::WorkspaceName => WizardFocus::BookmarkSearch,
+                        WizardFocus::BookmarkSearch => WizardFocus::WorkspaceName,
+                    };
+                    error = None;
+                }
                 KeyCode::Enter => {
-                    if bookmarks.is_empty() {
-                        error = Some("select a base bookmark".into());
-                    } else if valid_workspace_name(&name) {
-                        break Some(WizardOutcome {
-                            workspace_name: name.clone(),
-                            base_revset: bookmarks[selected_bookmark].clone(),
+                    let Some(base_revset) =
+                        selected_base_revset(&bookmarks, &matching_indices, selected_match)
+                    else {
+                        error = Some(if bookmarks.is_empty() {
+                            "select a base bookmark".into()
+                        } else {
+                            "no bookmarks match the search".into()
                         });
-                    } else {
+                        continue;
+                    };
+                    if !valid_workspace_name(&name) {
                         error = Some("workspace name must match [A-Za-z0-9._/-]".into());
+                        continue;
                     }
+                    break Some(WizardOutcome {
+                        workspace_name: name.clone(),
+                        base_revset: base_revset.to_string(),
+                    });
                 }
                 KeyCode::Up => {
-                    selected_bookmark = selected_bookmark.saturating_sub(1);
+                    selected_match = selected_match.saturating_sub(1);
                     error = None;
                 }
                 KeyCode::Down => {
-                    if selected_bookmark + 1 < bookmarks.len() {
-                        selected_bookmark += 1;
+                    if selected_match + 1 < match_count {
+                        selected_match += 1;
                     }
                     error = None;
                 }
                 KeyCode::PageUp => {
-                    selected_bookmark = selected_bookmark.saturating_sub(5);
+                    selected_match = selected_match.saturating_sub(5);
                     error = None;
                 }
                 KeyCode::PageDown => {
-                    selected_bookmark =
-                        (selected_bookmark + 5).min(bookmarks.len().saturating_sub(1));
+                    selected_match = (selected_match + 5).min(match_count.saturating_sub(1));
                     error = None;
                 }
                 KeyCode::Home => {
-                    selected_bookmark = 0;
+                    selected_match = 0;
                     error = None;
                 }
                 KeyCode::End => {
-                    selected_bookmark = bookmarks.len().saturating_sub(1);
+                    selected_match = match_count.saturating_sub(1);
                     error = None;
                 }
                 KeyCode::Backspace => {
-                    if replace_on_type {
-                        name.clear();
-                        replace_on_type = false;
-                    } else {
-                        name.pop();
+                    match focus {
+                        WizardFocus::WorkspaceName => {
+                            if replace_on_type {
+                                name.clear();
+                                replace_on_type = false;
+                            } else {
+                                name.pop();
+                            }
+                        }
+                        WizardFocus::BookmarkSearch => {
+                            bookmark_query.pop();
+                            selected_match = 0;
+                        }
                     }
                     error = None;
                 }
                 KeyCode::Char(c) => {
-                    if replace_on_type {
-                        name.clear();
-                        replace_on_type = false;
+                    match focus {
+                        WizardFocus::WorkspaceName => {
+                            if replace_on_type {
+                                name.clear();
+                                replace_on_type = false;
+                            }
+                            name.push(c);
+                        }
+                        WizardFocus::BookmarkSearch => {
+                            bookmark_query.push(c);
+                            selected_match = 0;
+                        }
                     }
-                    name.push(c);
                     error = None;
                 }
                 _ => {}
@@ -356,29 +421,32 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io
     Ok(())
 }
 
-/// Mirrors herdr's `render_new_linked_worktree_overlay`, with a bookmark picker.
-fn draw_wizard(
-    frame: &mut Frame,
-    name: &str,
-    repo_name: &str,
-    root: &Path,
-    bookmarks: &[String],
-    selected_bookmark: usize,
-    error: Option<&str>,
-) {
+/// Mirrors herdr's `render_new_linked_worktree_overlay`, with a searchable bookmark picker.
+fn draw_wizard(frame: &mut Frame, view: WizardView<'_>) {
+    let WizardView {
+        name,
+        repo_name,
+        root,
+        bookmarks,
+        bookmark_query,
+        matching_indices,
+        selected_match,
+        focus,
+        error,
+    } = view;
     let p = catppuccin();
     let area = frame.area();
     dim_background(frame, area);
-    let Some(inner) = render_modal_shell(frame, area, 76, 18, &p) else {
+    let Some(inner) = render_modal_shell(frame, area, 76, 21, &p) else {
         return;
     };
-    if inner.height < 12 {
+    if inner.height < 15 {
         return;
     }
 
-    let list_height = inner.height.saturating_sub(11).max(1).min(5);
-    let checkout_label_y = 7 + list_height;
-    let checkout_value_y = 8 + list_height;
+    let list_height = inner.height.saturating_sub(14).clamp(1, 5);
+    let checkout_label_y = 10 + list_height;
+    let checkout_value_y = 11 + list_height;
     let status_y = inner.height.saturating_sub(2);
     let line = |offset: u16| Rect::new(inner.x, inner.y + offset, inner.width, 1);
     render_modal_header(frame, line(0), "new jj workspace", &p);
@@ -387,27 +455,57 @@ fn draw_wizard(
         Paragraph::new(" workspace").style(Style::default().fg(p.overlay0)),
         line(2),
     );
-    let input_rect = line(3);
-    frame.render_widget(Clear, input_rect);
-    frame.render_widget(
-        Paragraph::new(format!(" {name}█")).style(Style::default().fg(p.text).bg(p.surface0)),
-        input_rect,
+    render_input_line(
+        frame,
+        line(3),
+        name,
+        "",
+        focus == WizardFocus::WorkspaceName,
+        &p,
     );
 
-    let selected = selected_bookmark.min(bookmarks.len().saturating_sub(1));
+    let search_label = if focus == WizardFocus::BookmarkSearch {
+        " bookmark search (editing)"
+    } else {
+        " bookmark search (tab or ctrl+f)"
+    };
+    frame.render_widget(
+        Paragraph::new(search_label).style(Style::default().fg(p.overlay0)),
+        line(5),
+    );
+    render_input_line(
+        frame,
+        line(6),
+        bookmark_query,
+        "all bookmarks",
+        focus == WizardFocus::BookmarkSearch,
+        &p,
+    );
+
+    let selected = selected_match.min(matching_indices.len().saturating_sub(1));
     let base_label = if bookmarks.is_empty() {
         " base bookmark".to_string()
-    } else {
+    } else if bookmark_query.is_empty() {
         format!(" base bookmark ({}/{})  ↑/↓", selected + 1, bookmarks.len())
+    } else if matching_indices.is_empty() {
+        format!(" base bookmark (0 matches, {} total)", bookmarks.len())
+    } else {
+        format!(
+            " base bookmark ({}/{} matches, {} total)  ↑/↓",
+            selected + 1,
+            matching_indices.len(),
+            bookmarks.len()
+        )
     };
     frame.render_widget(
         Paragraph::new(base_label).style(Style::default().fg(p.overlay0)),
-        line(5),
+        line(8),
     );
     render_bookmark_list(
         frame,
-        Rect::new(inner.x, inner.y + 6, inner.width, list_height),
+        Rect::new(inner.x, inner.y + 9, inner.width, list_height),
         bookmarks,
+        matching_indices,
         selected,
         &p,
     );
@@ -432,9 +530,14 @@ fn draw_wizard(
 
     let status = if let Some(error) = error {
         Paragraph::new(format!(" {error}")).style(Style::default().fg(p.red))
-    } else {
-        Paragraph::new(" enter: create  esc: cancel  arrows: change base bookmark")
+    } else if focus == WizardFocus::BookmarkSearch {
+        Paragraph::new(" type/backspace: filter  tab: workspace  enter: create  esc: cancel")
             .style(Style::default().fg(p.overlay0))
+    } else {
+        Paragraph::new(
+            " enter: create  esc: cancel  tab/ctrl+f: search bookmarks  arrows: change base",
+        )
+        .style(Style::default().fg(p.overlay0))
     };
     frame.render_widget(status, line(status_y));
 
@@ -461,14 +564,46 @@ fn draw_wizard(
     );
 }
 
+fn render_input_line(
+    frame: &mut Frame,
+    area: Rect,
+    value: &str,
+    placeholder: &str,
+    focused: bool,
+    p: &Palette,
+) {
+    frame.render_widget(Clear, area);
+    let visible_value = if value.is_empty() && !focused {
+        placeholder
+    } else {
+        value
+    };
+    let cursor = if focused { "█" } else { "" };
+    let style = if focused {
+        Style::default().fg(p.text).bg(p.surface0)
+    } else if value.is_empty() && !placeholder.is_empty() {
+        Style::default().fg(p.overlay0).bg(p.surface0)
+    } else {
+        Style::default().fg(p.subtext0).bg(p.surface0)
+    };
+    frame.render_widget(
+        Paragraph::new(fit_text(&format!(" {visible_value}{cursor}"), area.width)).style(style),
+        area,
+    );
+}
+
 fn render_bookmark_list(
     frame: &mut Frame,
     area: Rect,
     bookmarks: &[String],
-    selected_bookmark: usize,
+    matching_indices: &[usize],
+    selected_match: usize,
     p: &Palette,
 ) {
     frame.render_widget(Clear, area);
+    if area.height == 0 {
+        return;
+    }
     if bookmarks.is_empty() {
         frame.render_widget(
             Paragraph::new(" no bookmarks found").style(Style::default().fg(p.red)),
@@ -476,29 +611,40 @@ fn render_bookmark_list(
         );
         return;
     }
+    if matching_indices.is_empty() {
+        frame.render_widget(
+            Paragraph::new(" no matching bookmarks").style(Style::default().fg(p.red)),
+            Rect::new(area.x, area.y, area.width, 1),
+        );
+        return;
+    }
 
     let visible_rows = area.height as usize;
-    let selected = selected_bookmark.min(bookmarks.len() - 1);
+    let selected = selected_match.min(matching_indices.len() - 1);
     let mut start = selected.saturating_sub(visible_rows / 2);
-    if start + visible_rows > bookmarks.len() {
-        start = bookmarks.len().saturating_sub(visible_rows);
+    if start + visible_rows > matching_indices.len() {
+        start = matching_indices.len().saturating_sub(visible_rows);
     }
 
     for row in 0..visible_rows {
         let idx = start + row;
-        if idx >= bookmarks.len() {
+        if idx >= matching_indices.len() {
             break;
         }
         let selected_row = idx == selected;
         let marker = if selected_row { "›" } else { " " };
         let more_marker = if row == 0 && start > 0 {
             "↑"
-        } else if row + 1 == visible_rows && idx + 1 < bookmarks.len() {
+        } else if row + 1 == visible_rows && idx + 1 < matching_indices.len() {
             "↓"
         } else {
             marker
         };
-        let text = fit_text(&format!(" {more_marker} {}", bookmarks[idx]), area.width);
+        let bookmark_idx = matching_indices[idx];
+        let text = fit_text(
+            &format!(" {more_marker} {}", bookmarks[bookmark_idx]),
+            area.width,
+        );
         let style = if selected_row {
             Style::default()
                 .fg(panel_contrast_fg(p))
@@ -512,6 +658,39 @@ fn render_bookmark_list(
             Rect::new(area.x, area.y + row as u16, area.width, 1),
         );
     }
+}
+
+fn selected_base_revset<'a>(
+    bookmarks: &'a [String],
+    matching_indices: &[usize],
+    selected_match: usize,
+) -> Option<&'a str> {
+    matching_indices
+        .get(selected_match)
+        .and_then(|idx| bookmarks.get(*idx))
+        .map(String::as_str)
+}
+
+fn matching_bookmark_indices(bookmarks: &[String], query: &str) -> Vec<usize> {
+    let terms: Vec<String> = query
+        .split_whitespace()
+        .map(|term| term.to_ascii_lowercase())
+        .collect();
+    if terms.is_empty() {
+        return (0..bookmarks.len()).collect();
+    }
+
+    bookmarks
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, bookmark)| {
+            let bookmark = bookmark.to_ascii_lowercase();
+            terms
+                .iter()
+                .all(|term| bookmark.contains(term))
+                .then_some(idx)
+        })
+        .collect()
 }
 
 fn fit_text(text: &str, width: u16) -> String {
@@ -866,4 +1045,34 @@ fn json_string_field(json: &str, key: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::matching_bookmark_indices;
+
+    #[test]
+    fn empty_bookmark_search_returns_all_indices() {
+        let bookmarks = vec!["main".to_string(), "feature/search".to_string()];
+
+        assert_eq!(matching_bookmark_indices(&bookmarks, ""), vec![0, 1]);
+    }
+
+    #[test]
+    fn bookmark_search_is_case_insensitive_and_matches_all_terms() {
+        let bookmarks = vec![
+            "main".to_string(),
+            "feature/search-ui".to_string(),
+            "feature/bookmark-search@origin".to_string(),
+        ];
+
+        assert_eq!(
+            matching_bookmark_indices(&bookmarks, "SEARCH feature"),
+            vec![1, 2]
+        );
+        assert_eq!(
+            matching_bookmark_indices(&bookmarks, "bookmark origin"),
+            vec![2]
+        );
+    }
 }
