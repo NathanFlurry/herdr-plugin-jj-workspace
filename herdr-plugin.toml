@@ -37,3 +37,16 @@ id = "remove"
 title = "Remove jj workspace"
 contexts = ["workspace"]
 command = ["./target/release/jj-workspace", "remove"]
+
+# Explicitly abandon a clean workspace after typing its exact task name.
+[[actions]]
+id = "abandon"
+title = "Abandon jj workspace"
+contexts = ["workspace"]
+command = ["./target/release/jj-workspace", "open-abandon"]
+
+[[panes]]
+id = "abandon-wizard"
+title = "Abandon jj workspace"
+placement = "overlay"
+command = ["./target/release/jj-workspace", "abandon"]
